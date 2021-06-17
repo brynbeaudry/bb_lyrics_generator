@@ -1,8 +1,6 @@
 """Train a song generating model."""
 import argparse
-import csv
 import datetime
-import enum
 import os
 import statistics
 
@@ -10,6 +8,7 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 import tensorflow_hub as hub
+import tensorflow_text
 
 from . import config, embedding, util
 
@@ -20,6 +19,10 @@ def prepare_data(
     use_full_sentences=False,
     use_strings=False,
     num_lines_to_include=config.NUM_LINES_TO_INCLUDE,
+    max_repeats=config.MAX_REPEATS,
+    char_level=False,
+    profanity_censor=False,
+    max_num_words=config.MAX_NUM_WORDS,
 ):
     """Prepare songs for training, including tokenizing and word preprocessing.
 
@@ -37,6 +40,11 @@ def prepare_data(
     num_lines_to_include: int
         The number of lines to include in the sequences. A "line" is found by
         taking the median length of lines over all songs.
+    max_repeats: int
+        The number of times a sentence can repeat between newlines
+    char_level: bool
+        Whether or not to prepare for character-level modeling or not. The
+        default is False, meaning the data is prepared to word-level
 
     Returns
     -------
@@ -52,10 +60,17 @@ def prepare_data(
         The Keras preproceessing tokenizer used for transforming sentences.
 
     """
-    songs = util.prepare_songs(songs, transform_words=transform_words)
-    tokenizer = util.prepare_tokenizer(songs)
+    songs = util.prepare_songs(
+        songs,
+        transform_words=transform_words,
+        max_repeats=max_repeats,
+        profanity_censor=profanity_censor,
+    )
+    tokenizer = util.prepare_tokenizer(
+        songs, char_level=char_level, num_words=max_num_words
+    )
 
-    num_words = min(config.MAX_NUM_WORDS, len(tokenizer.word_index))
+    num_words = min(max_num_words, len(tokenizer.word_index))
 
     print("Encoding all songs to integer sequences")
     if use_full_sentences:
@@ -65,7 +80,6 @@ def prepare_data(
     print("Took {}".format(datetime.datetime.now() - now))
     print()
 
-    # Find the newline integer
     newline_int = tokenizer.word_index["\n"]
 
     # Calculate the average/median length of each sentence before a newline is seen.
@@ -130,9 +144,7 @@ def prepare_data(
             # Manually pad/slice the sequences to the proper length
             # This avoids an expensive call to pad_sequences afterwards.
             if len(seq) < seq_length:
-                zeros = [0] * (seq_length - len(seq))
-                zeros.extend(seq)
-                seq = zeros
+                seq.extend([0] * (seq_length - len(seq)))
             seq = seq[-seq_length:]
             X.append(seq)
             y.append(song_encoded[i])
@@ -141,6 +153,8 @@ def prepare_data(
 
     if use_strings:
         X = tokenizer.sequences_to_texts(X)
+
+    print(f"Total number of samples: {len(X)}")
 
     return X, y, seq_length, num_words, tokenizer
 
@@ -152,7 +166,14 @@ def create_model(
     embedding_dim=config.EMBEDDING_DIM,
     embedding_not_trainable=False,
     tfjs_compatible=False,
+    gpu_speedup=False,
 ):
+    if not tfjs_compatible:
+        print("Model will be created without tfjs support")
+
+    if gpu_speedup:
+        print("Model will be created with better GPU compatibility")
+
     # The + 1 accounts for the OOV token
     actual_num_words = num_words + 1
 
@@ -161,15 +182,22 @@ def create_model(
         input_dim=actual_num_words,
         output_dim=embedding_dim,
         input_length=seq_length,
-        weights=[embedding_matrix],
+        weights=[embedding_matrix] if embedding_matrix is not None else None,
         mask_zero=True,
         name="song_embedding",
     )(inp)
-    x = tf.keras.layers.GRU(
-        128, return_sequences=True, reset_after=not tfjs_compatible
+    x = tf.keras.layers.Bidirectional(
+        tf.keras.layers.GRU(
+            128, return_sequences=True, reset_after=gpu_speedup or not tfjs_compatible
+        )
     )(x)
-    x = tf.keras.layers.GRU(
-        128, dropout=0.2, recurrent_dropout=0.2, reset_after=not tfjs_compatible
+    x = tf.keras.layers.Bidirectional(
+        tf.keras.layers.GRU(
+            128,
+            dropout=0.2,
+            recurrent_dropout=0.0 if gpu_speedup else 0.2,
+            reset_after=gpu_speedup or not tfjs_compatible,
+        )
     )(x)
     x = tf.keras.layers.Dense(128, activation="relu")(x)
     x = tf.keras.layers.Dropout(0.3)(x)
@@ -190,16 +218,31 @@ def create_model(
 
 
 def create_transformer_model(
-    num_words, transformer_network, trainable=True,
+    num_words,
+    transformer_network,
+    trainable=True,
 ):
     inp = tf.keras.layers.Input(shape=[], dtype=tf.string)
-    x = hub.KerasLayer(
-        "https://tfhub.dev/google/universal-sentence-encoder/4",
-        trainable=trainable,
-        input_shape=[],
-        dtype=tf.string,
-    )(inp)
-    x = tf.keras.layers.Dense(64, activation="relu")(x)
+
+    if transformer_network == "use":
+        x = hub.KerasLayer(
+            "https://tfhub.dev/google/universal-sentence-encoder/4",
+            trainable=trainable,
+            input_shape=[],
+            dtype=tf.string,
+        )(inp)
+        x = tf.keras.layers.Dense(64, activation="relu")(x)
+    elif transformer_network == "bert":
+        # XXX: This is the smallest possible bert encoder. We can't expect wonders.
+        x = hub.KerasLayer("https://tfhub.dev/tensorflow/bert_en_uncased_preprocess/3")(
+            inp
+        )
+        outputs = hub.KerasLayer(
+            "https://tfhub.dev/tensorflow/small_bert/bert_en_uncased_L-2_H-128_A-2/2",
+            trainable=trainable,
+        )(x)
+        x = outputs["pooled_output"]
+        x = tf.keras.layers.Dropout(0.1)(x)
 
     # The + 1 accounts for the OOV token which can sometimes be present as the target word
     outp = tf.keras.layers.Dense(num_words + 1, activation="softmax")(x)
@@ -207,14 +250,15 @@ def create_transformer_model(
     model = tf.keras.models.Model(inputs=inp, outputs=outp)
 
     model.compile(
-        loss="sparse_categorical_crossentropy", optimizer="adam", metrics=["accuracy"],
+        loss="sparse_categorical_crossentropy",
+        optimizer="adam",
+        metrics=["accuracy"],
     )
     model.summary()
     return model
 
 
 def train(
-    epochs=100,
     export_dir=None,
     songdata_file=config.SONGDATA_FILE,
     artists=config.ARTISTS,
@@ -228,6 +272,13 @@ def train(
     batch_size=config.BATCH_SIZE,
     max_epochs=config.MAX_EPOCHS,
     tfjs_compatible=False,
+    gpu_speedup=False,
+    save_freq=config.SAVE_FREQUENCY,
+    max_repeats=config.MAX_REPEATS,
+    char_level=False,
+    early_stopping_patience=config.EARLY_STOPPING_PATIENCE,
+    profanity_censor=False,
+    max_num_words=config.MAX_NUM_WORDS,
 ):
     if export_dir is None:
         export_dir = "./export/{}".format(
@@ -244,6 +295,10 @@ def train(
         use_full_sentences=use_full_sentences,
         use_strings=bool(transformer_network),
         num_lines_to_include=num_lines_to_include,
+        max_repeats=max_repeats,
+        char_level=char_level,
+        profanity_censor=profanity_censor,
+        max_num_words=max_num_words,
     )
     util.pickle_tokenizer(tokenizer, export_dir)
 
@@ -254,17 +309,22 @@ def train(
         model = create_transformer_model(
             num_words, transformer_network, trainable=not embedding_not_trainable
         )
+        # Some transformer networks are slow to save, let's just save it every epoch.
+        save_freq = "epoch" if transformer_network == "use" else save_freq
     else:
-        print(f"Using precreated embeddings from {embedding_file}")
-        embedding_mapping = embedding.create_embedding_mappings(
-            embedding_file=embedding_file
-        )
-        embedding_matrix = embedding.create_embedding_matrix(
-            tokenizer,
-            embedding_mapping,
-            embedding_dim=embedding_dim,
-            max_num_words=num_words,
-        )
+        embedding_matrix = None
+        # Don't use word embeddings on char-level training.
+        if not char_level:
+            print(f"Using precreated embeddings from {embedding_file}")
+            embedding_mapping = embedding.create_embedding_mappings(
+                embedding_file=embedding_file
+            )
+            embedding_matrix = embedding.create_embedding_matrix(
+                tokenizer,
+                embedding_mapping,
+                embedding_dim=embedding_dim,
+                max_num_words=num_words,
+            )
         model = create_model(
             seq_length,
             num_words,
@@ -272,6 +332,7 @@ def train(
             embedding_dim=embedding_dim,
             embedding_not_trainable=embedding_not_trainable,
             tfjs_compatible=tfjs_compatible,
+            gpu_speedup=gpu_speedup,
         )
 
     print(
@@ -286,13 +347,16 @@ def train(
         epochs=max_epochs,
         callbacks=[
             tf.keras.callbacks.EarlyStopping(
-                monitor="loss", patience=3, verbose=1, min_delta=0.001
+                monitor="loss",
+                patience=early_stopping_patience,
+                verbose=1,
+                min_delta=0.001,
             ),
             tf.keras.callbacks.ModelCheckpoint(
                 "{}/model.h5".format(export_dir),
                 monitor="loss",
                 save_best_only=True,
-                save_freq=10,
+                save_freq=save_freq,
                 verbose=1,
             ),
         ],
@@ -354,7 +418,7 @@ if __name__ == "__main__":
             Use a transformer architecture like the universal sentence encoder
             rather than a recurrent neural network.
         """,
-        choices=["use"],
+        choices=["use", "bert"],
     )
     parser.add_argument(
         "--num-lines-to-include",
@@ -395,6 +459,68 @@ if __name__ == "__main__":
             compatible in the first place.
         """,
     )
+    parser.add_argument(
+        "--gpu-speedup",
+        action="store_true",
+        help="""
+            Make adjustments to the recurrent unit settings in the network to
+            allow using a cuDNN-specific implementation for a potential speedup.
+            See https://www.tensorflow.org/api_docs/python/tf/keras/layers/GRU
+        """,
+    )
+    parser.add_argument(
+        "--max-repeats",
+        type=int,
+        default=config.MAX_REPEATS,
+        help="""
+            If a sentences repeats multiple times (for example in a very long
+            and repeating chorus), reduce the number of repeats for model
+            training to this number. Repeats are delimited by a newline for
+            simplicity.
+            By default, anything above 2 repeats are discarded for training.
+        """,
+    )
+    parser.add_argument(
+        "--save-freq",
+        type=int,
+        default=config.SAVE_FREQUENCY,
+        help=f"""How often to save a snapshot of the model (if it has improved
+        since last snapshot). Model saving can take some time so if batches are
+        very fast, you might want to increase this number.
+        The default is {config.SAVE_FREQUENCY}.
+        """,
+    )
+    parser.add_argument(
+        "--char-level",
+        action="store_true",
+        help="""Determines whether to use a character-level model, i.e. the
+        model will predict the next character instead of the next word.
+        """,
+    )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=config.EARLY_STOPPING_PATIENCE,
+        help=f"""How many epochs with no loss improvements before doing early
+        stopping. For small datasets, you might want to increase this.
+        Default is {config.EARLY_STOPPING_PATIENCE}
+        """,
+    )
+    parser.add_argument(
+        "--profanity-censor",
+        action="store_true",
+        help=f"""Replace certain words with **** during preprocessing training.
+        This eliminates some of the bad words that artists might use. This can
+        be useful for presentations :-)
+        """,
+    )
+    parser.add_argument(
+        "--max-num-words",
+        type=int,
+        default=config.MAX_NUM_WORDS,
+        help=f"""Maximum number of words to include in the output. Default is
+        {config.MAX_NUM_WORDS}""",
+    )
     args = parser.parse_args()
     artists = args.artists if args.artists != ["*"] else []
     train(
@@ -409,4 +535,11 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         max_epochs=args.max_epochs,
         tfjs_compatible=args.tfjs_compatible,
+        gpu_speedup=args.gpu_speedup,
+        max_repeats=args.max_repeats,
+        save_freq=args.save_freq,
+        char_level=args.char_level,
+        early_stopping_patience=args.early_stopping_patience,
+        profanity_censor=args.profanity_censor,
+        max_num_words=args.max_num_words,
     )
